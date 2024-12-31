@@ -139,8 +139,8 @@ def is_tiktoker_message(message: Message) -> bool:
         'vm.tiktok.com',
         'tiktokcdn.com',
         'spotify.com',
-        'youtube.com/shorts',
-        'instagram.com/reel',
+        'youtube.com',
+        'instagram.com',
     ]
     return any(domain in text for domain in domains)
 
