@@ -76,7 +76,10 @@ class MessageChain:
     target: Optional[MessageInstanceId] = None
     shared: Optional[MessageInstanceId] = None
 
-    timestamp_ms: int = now()
+    timestamp_ms: int = -1
+
+    def __post_init__(self):
+        self.timestamp_ms = now()
 
     def is_expired(self, threshold_ms=10 * 60 * 1000):
         return self.timestamp_ms + threshold_ms < now()
@@ -119,7 +122,8 @@ def cleanup_chains():
                 previous.author = chain.author
             continue
 
-        shared[chain.shared] = chain
+        if chain.shared is not None:
+            shared[chain.shared] = chain
         new_chains.append(chain)
 
     CHAINS = new_chains
@@ -364,6 +368,8 @@ async def user_message_deleted(event: events.MessageDeleted.Event):
     if not event.chat_id or not event.deleted_id:
         return
     message_id = MessageInstanceId(event.chat_id, event.deleted_id)
+
+    logging.info(f'Processing deletion for {message_id}')
 
     target_chain = select_chain(target=message_id)
     if target_chain:
