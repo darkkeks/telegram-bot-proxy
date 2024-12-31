@@ -313,6 +313,7 @@ async def bot_message_edited(event: events.MessageEdited.Event):
         message=chain.target.message_id,  # type: ignore
         text=message.message,
         file=message.media,  # type: ignore
+        formatting_entities=message.entities,
     )
 
 
@@ -342,6 +343,7 @@ async def user_message_edited(event: events.MessageEdited.Event):
             message=chain.shared.message_id,  # type: ignore
             text=message.message,
             file=message.media,  # type: ignore
+            formatting_entities=message.entities,
         )
     elif chain.target:
         await user_client.edit_message(
@@ -349,6 +351,7 @@ async def user_message_edited(event: events.MessageEdited.Event):
             message=chain.target.message_id,  # type: ignore
             text=message.message,
             file=message.media,  # type: ignore
+            formatting_entities=message.entities,
         )
     else:
         logging.warning(f'Unexpected chain edit: {chain}')
