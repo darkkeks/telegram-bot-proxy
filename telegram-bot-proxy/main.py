@@ -27,6 +27,9 @@ class ProxyRule:
     sandbox_chat_id: int
     media_share_chat_id: int
 
+    def has_chat_id(self, chat_id: int):
+        return chat_id in (self.chat_id, self.sandbox_chat_id, self.media_share_chat_id)
+
 
 RULES = [
     ProxyRule(
@@ -36,28 +39,91 @@ RULES = [
     ),
 ]
 
+def select_rule(chat_id: int) -> Optional[ProxyRule]:
+    for rule in RULES:
+        if rule.has_chat_id(chat_id):
+            return rule
+    return None
+
+
+def now():
+    return int(1000 * time.time())
+
 
 @dataclass
-class RecentMessage:
+class AuthorMeta:
+    user_id: int
+    first_name: str
+
+    @classmethod
+    def from_user(cls, user: User) -> Optional['AuthorMeta']:
+        if not user.first_name:
+            return None
+        return cls(user.id, user.first_name)
+
+
+@dataclass(frozen=True)
+class MessageInstanceId:
     chat_id: int
     message_id: int
-    user_id: int
-    user_first_name: Optional[str]
-    sandbox_chat_id: int
-    sandbox_message_id: int
-    timestamp_ms: int
 
 
-NOT_RECENT_ANYMORE_MS = 5 * 60 * 1000
-RECENT_MESSAGES: list[RecentMessage] = []
+@dataclass
+class MessageChain:
+    author: Optional[AuthorMeta] = None
+
+    source: Optional[MessageInstanceId] = None
+    target: Optional[MessageInstanceId] = None
+    shared: Optional[MessageInstanceId] = None
+
+    timestamp_ms: int = now()
+
+    def is_expired(self, threshold_ms=10 * 60 * 1000):
+        return self.timestamp_ms + threshold_ms < now()
 
 
-def cleanup_recent_messages():
-    global RECENT_MESSAGES
-    RECENT_MESSAGES = [
-        rm for rm in RECENT_MESSAGES
-        if int(1000 * time.time()) - rm.timestamp_ms < NOT_RECENT_ANYMORE_MS
-    ]
+CHAINS: list[MessageChain] = []
+
+
+def select_chain(source: Optional[MessageInstanceId] = None,
+                 target: Optional[MessageInstanceId] = None,
+                 shared: Optional[MessageInstanceId] = None) -> Optional[MessageChain]:
+    for chain in CHAINS:
+        if source is not None and chain.source != source:
+            continue
+        if target is not None and chain.target != target:
+            continue
+        if shared is not None and chain.shared != shared:
+            continue
+        return chain
+    return None
+
+
+def cleanup_chains():
+    global CHAINS
+
+    new_chains = []
+    shared = {}
+    for chain in CHAINS:
+        if chain.is_expired():
+            continue
+
+        # merge chains that have the same shared message.
+        previous = shared.get(chain.shared, None)
+        if previous is not None:
+            if chain.target is not None and previous.target is None:
+                previous.target = chain.target
+            if chain.source is not None and previous.source is None:
+                previous.source = chain.source
+            if chain.author is not None and previous.author is None:
+                previous.author = chain.author
+            continue
+
+        shared[chain.shared] = chain
+        new_chains.append(chain)
+
+    CHAINS = new_chains
+    logging.info(f'Current chains: {CHAINS}')
 
 
 def is_tiktoker_message(message: Message) -> bool:
@@ -76,121 +142,243 @@ def is_tiktoker_message(message: Message) -> bool:
 
 
 def try_patch_name(message) -> Message:
-    logging.info(f'Trying to patch {message.stringify()}')
+    message_id = MessageInstanceId(message.chat_id, message.id)
+    logging.info(f'Patching {message_id}')
 
-    last_message = None
-    for rm in RECENT_MESSAGES:
-        if rm.sandbox_chat_id == message.chat_id:
-            if last_message is None or rm.timestamp_ms > last_message.timestamp_ms:
-                last_message = rm
+    chain = None
+    for c in CHAINS:
+        if not c.is_expired() and c.target and c.target.chat_id == message_id.chat_id:
+            if chain is None or c.timestamp_ms > chain.timestamp_ms:
+                chain = c
 
-    timestamp_current = int(1000 * time.time())
-    if not last_message or timestamp_current - last_message.timestamp_ms > NOT_RECENT_ANYMORE_MS or last_message.user_first_name is None:
-        logging.info(f'Bad last message: {last_message}')
+    if not chain or chain.author is None:
+        logging.info(f'Cannot patch, bad chain: {chain}')
         return message
 
     text = message.message
     match = re.search(r'^Downloaded: (.*)$', text, re.MULTILINE)
     if not match:
-        logging.info(f'Match not found: {message.message}, {match}')
+        logging.info(f'Cannot patch, message not matched')
+        return message
+
+    if not message.entities:
+        logging.info(f'Cannot patch, message has no entities')
         return message
 
     offset, length = match.start(1), len(match.group(1))
-
-    if not message.entities:
-        logging.info(f'No entities :(')
-        return message
-
-    message.message = text[:offset] + last_message.user_first_name + text[offset+length:]
+    message.message = text[:offset] + chain.author.first_name + text[offset+length:]
 
     for entity in message.entities:
-        if isinstance(entity, MessageEntityMentionName) and entity.offset == offset or entity.length == length:
-            entity.length = len(last_message.user_first_name)
-            entity.user_id = last_message.user_id
+        if isinstance(entity, MessageEntityMentionName) and entity.offset == offset and entity.length == length:
+            entity.length = len(chain.author.first_name)
+            entity.user_id = chain.author.user_id
             continue
 
         if entity.offset > offset:
             entity.offset -= len(match.group(1))
-            entity.offset += len(last_message.user_first_name)
-
-    logging.info(f'Patched! {message.stringify()}')
+            entity.offset += len(chain.author.first_name)
 
     return message
 
 
+async def fetch_user(message: Message) -> Optional[User]:
+    peer = message.from_id or message.peer_id
+    if not isinstance(peer, PeerUser):
+        return None
+
+    user = await user_client.get_entity(peer)
+    return typing.cast(User, user)
+
+
 @bot_client.on(events.NewMessage(incoming=True))
 async def bot_message_handler(event: events.NewMessage.Event):
-    cleanup_recent_messages()
-    for rule in RULES:
-        if event.chat_id == rule.chat_id:
-            logging.info(f'Received message from source chat {rule.chat_id}, forwarding to sandbox chat {rule.sandbox_chat_id}')
+    cleanup_chains()
 
-            message = event.message
-            if not is_tiktoker_message(message):
-                logging.info(f'Message not matched, id={message.id}')
-                continue
+    if not event.chat_id:
+        return
+    message_id = MessageInstanceId(event.chat_id, event.message.id)
 
-            peer = message.from_id or message.peer_id
-            if not isinstance(peer, PeerUser):
-                logging.info(f'Message is not from user, id={message.id}')
-                continue
+    rule = select_rule(message_id.chat_id)
+    if not rule:
+        return
 
-            user = await user_client.get_entity(peer)
-            user = typing.cast(User, user)
-            logging.info(f'Fetched user: {user.stringify()}')
+    if event.chat_id == rule.chat_id:
+        logging.info(f'Processing original message {message_id}')
 
-            sandbox_message = await user_client.send_message(rule.sandbox_chat_id, message)
+        message = event.message
+        if not is_tiktoker_message(message):
+            logging.info(f'Skipping message id={message_id}, not matched by filter')
+            return
 
-            recent_message = RecentMessage(
-                chat_id=message.chat_id,
-                message_id=message.id,
-                user_id=peer.user_id,
-                user_first_name=user.first_name,
-                sandbox_chat_id=rule.sandbox_chat_id,
-                sandbox_message_id=sandbox_message.id,
-                timestamp_ms=int(1000 * time.time()),
+        user = await fetch_user(message)
+        if user is None:
+            logging.info(f'Skipping message id={message_id}, not from user')
+            return
+
+        sandboxed = await user_client.send_message(rule.sandbox_chat_id, message)
+        sandboxed_id = MessageInstanceId(rule.sandbox_chat_id, sandboxed.id)
+
+        chain = MessageChain(
+            author=AuthorMeta.from_user(user),
+            source=message_id,
+            target=sandboxed_id,
+        )
+        logging.info(f'New chain: {chain}')
+        CHAINS.append(chain)
+
+    if event.chat_id == rule.media_share_chat_id:
+        logging.info(f'Processing media share message {message_id}')
+
+        target = await event.message.forward_to(rule.chat_id, drop_author=True)
+        target_id = MessageInstanceId(rule.chat_id, target.id)
+
+        chain = select_chain(shared=message_id)
+        if chain:
+            chain.target = target_id
+            logging.info(f'Updated chain: {chain}')
+        else:
+            # Previous chain may be missing if message was received before sender got confirmation.
+            chain = MessageChain(
+                shared=message_id,
+                target=target_id,
             )
-            logging.info(f'Recent message: {recent_message}')
-            RECENT_MESSAGES.append(recent_message)
-
-        if event.chat_id == rule.media_share_chat_id:
-            logging.info(f'Received message from media share chat {rule.media_share_chat_id}, forwarding to source chat {rule.chat_id}')
-
-            message = event.message
-            await message.forward_to(rule.chat_id, drop_author=True)
+            logging.info(f'New chain: {chain}')
+            CHAINS.append(chain)
 
 
 @user_client.on(events.NewMessage(incoming=True))
 async def user_message_handler(event: events.NewMessage.Event):
-    cleanup_recent_messages()
-    for rule in RULES:
-        if event.chat_id == rule.sandbox_chat_id:
-            logging.info(f'Received message from sandbox chat {rule.sandbox_chat_id}, forwarding to source chat {rule.chat_id}')
+    cleanup_chains()
 
-            message = event.message
+    if not event.chat_id:
+        return
+    message_id = MessageInstanceId(event.chat_id, event.message.id)
 
-            message = try_patch_name(message)
+    rule = select_rule(event.chat_id)
+    if not rule:
+        return
 
-            if not message.media:
-                await bot_client.send_message(rule.chat_id, message)
-            else:
-                await user_client.send_message(rule.media_share_chat_id, message)
+    if event.chat_id == rule.sandbox_chat_id:
+        logging.info(f'Processing sandbox message {message_id}')
+
+        message = event.message
+        message = try_patch_name(message)
+
+        user = await fetch_user(message)
+        if user is None:
+            logging.info(f'Skipping message id={message_id}, not from user')
+            return
+
+        if message.media:
+            shared = await user_client.send_message(rule.media_share_chat_id, message)
+            shared_id = MessageInstanceId(rule.media_share_chat_id, shared.id)
+            chain = MessageChain(
+                author=AuthorMeta.from_user(user),
+                source=message_id,
+                shared=shared_id,
+            )
+        else:
+            passed = await bot_client.send_message(rule.chat_id, message)
+            passed_id = MessageInstanceId(rule.chat_id, passed.id)
+            chain = MessageChain(
+                author=AuthorMeta.from_user(user),
+                source=message_id,
+                target=passed_id,
+            )
+
+        logging.info(f'New chain: {chain}')
+        CHAINS.append(chain)
+
+
+@bot_client.on(events.MessageEdited())
+async def bot_message_edited(event: events.MessageEdited.Event):
+    cleanup_chains()
+
+    if not event.chat_id:
+        return
+    message_id = MessageInstanceId(event.chat_id, event.message.id)
+
+    chain = select_chain(shared=message_id)
+    if not chain:
+        logging.info(f'Skipping edited shared message {message_id}, no chain found')
+        return
+
+    message = event.message
+    if not chain.target:
+        logging.warning(f'Unexpected chain edit: {chain}')
+        return
+
+    await bot_client.edit_message(
+        entity=chain.target.chat_id,
+        message=chain.target.message_id,  # type: ignore
+        text=message.message,
+        file=message.media,  # type: ignore
+    )
+
+
+@user_client.on(events.MessageEdited())
+async def user_message_edited(event: events.MessageEdited.Event):
+    cleanup_chains()
+
+    if not event.chat_id:
+        return
+    message_id = MessageInstanceId(event.chat_id, event.message.id)
+
+    chain = select_chain(source=message_id)
+    if not chain:
+        logging.info(f'Skipping edited source message {message_id}, no chain found')
+        return
+
+    message = event.message
+    message = try_patch_name(message)
+
+    if message.media and not chain.shared:
+        logging.warning(f'Skipping message edit because media was added, but the chain has not been shared: {chain}')
+        return
+
+    if chain.shared:
+        await user_client.edit_message(
+            entity=chain.shared.chat_id,
+            message=chain.shared.message_id,  # type: ignore
+            text=message.message,
+            file=message.media,  # type: ignore
+        )
+    elif chain.target:
+        await user_client.edit_message(
+            entity=chain.target.chat_id,
+            message=chain.target.message_id,  # type: ignore
+            text=message.message,
+            file=message.media,  # type: ignore
+        )
+    else:
+        logging.warning(f'Unexpected chain edit: {chain}')
 
 
 @user_client.on(events.MessageDeleted())
 async def user_message_deleted(event: events.MessageDeleted.Event):
-    for rule in RULES:
-        if event.chat_id == rule.sandbox_chat_id:
-            recent_message = None
-            for rm in RECENT_MESSAGES:
-                if rm.sandbox_message_id == event.deleted_id:
-                    recent_message = rm
+    cleanup_chains()
 
-            if not recent_message:
-                continue
+    if not event.chat_id or not event.deleted_id:
+        return
+    message_id = MessageInstanceId(event.chat_id, event.deleted_id)
 
-            logging.info(f'Deleting original message: {recent_message}')
-            await bot_client.delete_messages(recent_message.chat_id, recent_message.message_id)
+    target_chain = select_chain(target=message_id)
+    if target_chain:
+        if not target_chain.source:
+            logging.warning(f'Deleted chain is missing source: {target_chain.source}')
+            return
+
+        logging.info(f'Deleting source message: {target_chain}')
+        await bot_client.delete_messages(target_chain.source.chat_id, target_chain.source.message_id)
+
+    source_chain = select_chain(source=message_id)
+    if source_chain:
+        if not source_chain.target:
+            logging.warning(f'Deleted chain is missing target: {source_chain.target}')
+            return
+
+        logging.info(f'Deleting target message: {source_chain}')
+        await bot_client.delete_messages(source_chain.target.chat_id, source_chain.target.message_id)
 
 
 if __name__ == '__main__':
