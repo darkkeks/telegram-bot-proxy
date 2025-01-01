@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from telethon import TelegramClient, events
 from telethon.tl.types import PeerUser, User, Message, MessageEntityMentionName
 from typing import Optional
+import asyncio
 import logging
 import os
 import re
@@ -56,7 +57,9 @@ class AuthorMeta:
     first_name: str
 
     @classmethod
-    def from_user(cls, user: User) -> Optional['AuthorMeta']:
+    def from_user(cls, user: Optional[User]) -> Optional['AuthorMeta']:
+        if not user:
+            return None
         if not user.first_name:
             return None
         return cls(user.id, user.first_name)
@@ -185,13 +188,17 @@ def try_patch_name(message) -> Message:
     return message
 
 
-async def fetch_user(message: Message) -> Optional[User]:
+async def fetch_user(client: TelegramClient, message: Message) -> Optional[User]:
     peer = message.from_id or message.peer_id
     if not isinstance(peer, PeerUser):
         return None
 
-    user = await user_client.get_entity(peer)
-    return typing.cast(User, user)
+    try:
+        user = await client.get_entity(peer)
+        return typing.cast(User, user)
+    except ValueError as e:
+        logging.warning(f'Failed to fetch peer {peer.stringify()}', e)
+        return None
 
 
 @bot_client.on(events.NewMessage(incoming=True))
@@ -214,10 +221,9 @@ async def bot_message_handler(event: events.NewMessage.Event):
             logging.info(f'Skipping message id={message_id}, not matched by filter')
             return
 
-        user = await fetch_user(message)
+        user = await fetch_user(bot_client, message)
         if user is None:
-            logging.info(f'Skipping message id={message_id}, not from user')
-            return
+            logging.warning(f'Failed to fetch user for message {message_id}')
 
         sandboxed = await user_client.send_message(rule.sandbox_chat_id, message)
         sandboxed_id = MessageInstanceId(rule.sandbox_chat_id, sandboxed.id)
@@ -268,10 +274,9 @@ async def user_message_handler(event: events.NewMessage.Event):
         message = event.message
         message = try_patch_name(message)
 
-        user = await fetch_user(message)
+        user = await fetch_user(user_client, message)
         if user is None:
-            logging.info(f'Skipping message id={message_id}, not from user')
-            return
+            logging.warning(f'Failed to fetch user for message {message_id}')
 
         if message.media:
             shared = await user_client.send_message(rule.media_share_chat_id, message)
@@ -390,7 +395,19 @@ async def user_message_deleted(event: events.MessageDeleted.Event):
         await bot_client.delete_messages(source_chain.target.chat_id, source_chain.target.message_id)
 
 
+async def main():
+    async with bot_client, user_client:
+        await bot_client.start(bot_token=bot_token)  # type: ignore
+        await user_client.start()  # type: ignore
+
+        await asyncio.wait([
+            asyncio.create_task(bot_client.run_until_disconnected()),  # type: ignore
+            asyncio.create_task(user_client.run_until_disconnected()),  # type: ignore
+        ], return_when=asyncio.FIRST_COMPLETED)
+
+
 if __name__ == '__main__':
-    bot_client.start(bot_token=bot_token)
-    user_client.start()
-    user_client.run_until_disconnected()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
