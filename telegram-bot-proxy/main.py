@@ -1,6 +1,7 @@
 import uuid as uuid_module
 from dataclasses import dataclass
 from telethon import TelegramClient, events
+from telethon.errors import MessageNotModifiedError
 from telethon.tl.types import (
     PeerUser, User, Message, MessageEntityMentionName,
     ReplyInlineMarkup, KeyboardButtonRow, KeyboardButtonCallback,
@@ -389,6 +390,11 @@ async def user_message_handler(event: events.NewMessage.Event):
                 )
                 if markup:
                     await bot_client.edit_message(rule.chat_id, passed.id, buttons=markup)
+                    logging.info(f'Proxied {len(markup.rows)} button rows to main chat')
+                else:
+                    logging.info(f'Message has reply_markup but no callback buttons to proxy')
+            else:
+                logging.info(f'Message has no reply_markup')
 
         logging.info(f'New chain: {chain}')
         CHAINS.append(chain)
@@ -441,7 +447,8 @@ async def user_message_edited(event: events.MessageEdited.Event):
         logging.warning(f'Skipping message edit because media was added, but the chain has not been shared: {chain}')
         return
 
-    if chain.shared:
+    try:
+      if chain.shared:
         await user_client.edit_message(
             entity=chain.shared.chat_id,
             message=chain.shared.message_id,  # type: ignore
@@ -449,7 +456,7 @@ async def user_message_edited(event: events.MessageEdited.Event):
             file=message.media,  # type: ignore
             formatting_entities=message.entities,
         )
-    elif chain.target:
+      elif chain.target:
         await user_client.edit_message(
             entity=chain.target.chat_id,
             message=chain.target.message_id,  # type: ignore
@@ -457,8 +464,9 @@ async def user_message_edited(event: events.MessageEdited.Event):
             file=message.media,  # type: ignore
             formatting_entities=message.entities,
         )
+    except MessageNotModifiedError:
+        logging.info(f'Message not modified, skipping edit for chain: {chain}')
 
-        # Update proxied buttons if markup changed
         if chain.source and message.reply_markup:
             markup = update_proxy_markup(
                 message.reply_markup,
@@ -473,7 +481,7 @@ async def user_message_edited(event: events.MessageEdited.Event):
                     chain.target.message_id,
                     buttons=markup,
                 )
-    else:
+    if not chain.target and not chain.shared:
         logging.warning(f'Unexpected chain edit: {chain}')
 
 
