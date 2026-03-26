@@ -10,4 +10,4 @@ RUN uv sync --frozen --no-install-project
 
 COPY . .
 
-CMD ["uv", "run", "--no-project", "python", "telegram-bot-proxy/main.py"]
+CMD ["/app/.venv/bin/python", "telegram-bot-proxy/main.py"]
