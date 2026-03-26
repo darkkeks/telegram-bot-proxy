@@ -6,8 +6,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen --no-install-project
+RUN uv pip install --system -r pyproject.toml
 
 COPY . .
 
-CMD ["/app/.venv/bin/python", "telegram-bot-proxy/main.py"]
+CMD ["python", "telegram-bot-proxy/main.py"]
