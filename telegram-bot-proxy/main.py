@@ -1,6 +1,10 @@
+import uuid as uuid_module
 from dataclasses import dataclass
 from telethon import TelegramClient, events
-from telethon.tl.types import PeerUser, User, Message, MessageEntityMentionName
+from telethon.tl.types import (
+    PeerUser, User, Message, MessageEntityMentionName,
+    ReplyInlineMarkup, KeyboardButtonRow, KeyboardButtonCallback,
+)
 from typing import Optional
 import asyncio
 import logging
@@ -90,6 +94,12 @@ class MessageChain:
 
 CHAINS: list[MessageChain] = []
 
+# Button proxy map:
+# (main_chat_id, main_msg_id, proxy_data: bytes) -> (sandbox_chat_id, sandbox_msg_id, original_data: bytes)
+# Cleaned up alongside chains (10 min TTL).
+BUTTON_MAP: dict[tuple, tuple] = {}
+BUTTON_MAP_TS: dict[tuple, int] = {}  # key -> created_at ms
+
 
 def select_chain(source: Optional[MessageInstanceId] = None,
                  target: Optional[MessageInstanceId] = None,
@@ -106,7 +116,7 @@ def select_chain(source: Optional[MessageInstanceId] = None,
 
 
 def cleanup_chains():
-    global CHAINS
+    global CHAINS, BUTTON_MAP, BUTTON_MAP_TS
 
     new_chains = []
     shared = {}
@@ -131,6 +141,56 @@ def cleanup_chains():
 
     CHAINS = new_chains
     logging.info(f'Current chains: {CHAINS}')
+
+    # Clean up expired button mappings
+    threshold = now() - 10 * 60 * 1000
+    expired_keys = [k for k, ts in BUTTON_MAP_TS.items() if ts < threshold]
+    for k in expired_keys:
+        BUTTON_MAP.pop(k, None)
+        BUTTON_MAP_TS.pop(k, None)
+
+
+def build_proxy_markup(
+    markup,
+    sandbox_chat_id: int,
+    sandbox_msg_id: int,
+    main_chat_id: int,
+    main_msg_id: int,
+) -> Optional[ReplyInlineMarkup]:
+    """Copy inline keyboard, replacing callback_data with proxy UUIDs."""
+    if not markup or not hasattr(markup, 'rows'):
+        return None
+
+    new_rows = []
+    for row in markup.rows:
+        new_btns = []
+        for btn in row.buttons:
+            if hasattr(btn, 'data'):
+                proxy_data = uuid_module.uuid4().bytes[:8]
+                key = (main_chat_id, main_msg_id, proxy_data)
+                BUTTON_MAP[key] = (sandbox_chat_id, sandbox_msg_id, btn.data)
+                BUTTON_MAP_TS[key] = now()
+                new_btns.append(KeyboardButtonCallback(text=btn.text, data=proxy_data))
+            else:
+                new_btns.append(btn)
+        new_rows.append(KeyboardButtonRow(buttons=new_btns))
+
+    return ReplyInlineMarkup(rows=new_rows)
+
+
+def update_proxy_markup(
+    markup,
+    sandbox_chat_id: int,
+    sandbox_msg_id: int,
+    main_chat_id: int,
+    main_msg_id: int,
+) -> Optional[ReplyInlineMarkup]:
+    """Rebuild proxy markup for an edited message, removing stale keys first."""
+    stale = [k for k in list(BUTTON_MAP) if k[0] == main_chat_id and k[1] == main_msg_id]
+    for k in stale:
+        BUTTON_MAP.pop(k, None)
+        BUTTON_MAP_TS.pop(k, None)
+    return build_proxy_markup(markup, sandbox_chat_id, sandbox_msg_id, main_chat_id, main_msg_id)
 
 
 def is_tiktoker_message(message: Message) -> bool:
@@ -256,6 +316,29 @@ async def bot_message_handler(event: events.NewMessage.Event):
             CHAINS.append(chain)
 
 
+@bot_client.on(events.CallbackQuery())
+async def callback_query_handler(event: events.CallbackQuery.Event):
+    cleanup_chains()
+
+    key = (event.chat_id, event.message_id, event.data)
+    mapping = BUTTON_MAP.get(key)
+    if not mapping:
+        logging.info(f'No button mapping for key chat={event.chat_id} msg={event.message_id}')
+        await event.answer('Кнопка устарела')
+        return
+
+    sandbox_chat_id, sandbox_msg_id, original_data = mapping
+    logging.info(f'Proxying button click to sandbox msg={sandbox_msg_id} data={original_data!r}')
+
+    try:
+        msg = await user_client.get_messages(sandbox_chat_id, ids=sandbox_msg_id)
+        await msg.click(data=original_data)
+        await event.answer()
+    except Exception as e:
+        logging.warning(f'Failed to proxy button click: {e}')
+        await event.answer('Ошибка при нажатии кнопки')
+
+
 @user_client.on(events.NewMessage(incoming=True))
 async def user_message_handler(event: events.NewMessage.Event):
     cleanup_chains()
@@ -294,6 +377,18 @@ async def user_message_handler(event: events.NewMessage.Event):
                 source=message_id,
                 target=passed_id,
             )
+
+            # Proxy inline keyboard buttons if present
+            if message.reply_markup:
+                markup = build_proxy_markup(
+                    message.reply_markup,
+                    sandbox_chat_id=message_id.chat_id,
+                    sandbox_msg_id=message_id.message_id,
+                    main_chat_id=rule.chat_id,
+                    main_msg_id=passed.id,
+                )
+                if markup:
+                    await bot_client.edit_message(rule.chat_id, passed.id, buttons=markup)
 
         logging.info(f'New chain: {chain}')
         CHAINS.append(chain)
@@ -362,6 +457,22 @@ async def user_message_edited(event: events.MessageEdited.Event):
             file=message.media,  # type: ignore
             formatting_entities=message.entities,
         )
+
+        # Update proxied buttons if markup changed
+        if chain.source and message.reply_markup:
+            markup = update_proxy_markup(
+                message.reply_markup,
+                sandbox_chat_id=chain.source.chat_id,
+                sandbox_msg_id=chain.source.message_id,
+                main_chat_id=chain.target.chat_id,
+                main_msg_id=chain.target.message_id,
+            )
+            if markup:
+                await bot_client.edit_message(
+                    chain.target.chat_id,
+                    chain.target.message_id,
+                    buttons=markup,
+                )
     else:
         logging.warning(f'Unexpected chain edit: {chain}')
 
