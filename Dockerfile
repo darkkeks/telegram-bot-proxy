@@ -1,14 +1,13 @@
-FROM python:latest
+FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml poetry.lock ./
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-RUN pip install --upgrade pip \
-    && pip install poetry \
-    && poetry install --no-root
+COPY pyproject.toml uv.lock ./
+
+RUN uv sync --frozen --no-install-project
 
 COPY . .
 
-CMD ["poetry", "run", "python", "telegram-bot-proxy/main.py"]
-
+CMD ["uv", "run", "python", "telegram-bot-proxy/main.py"]
