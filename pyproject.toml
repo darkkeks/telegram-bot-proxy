@@ -7,7 +7,3 @@ dependencies = [
     "telethon>=1.37.0",
     "cryptg>=0.5.0",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"

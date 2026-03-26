@@ -60,7 +60,7 @@ wheels = [
 [[package]]
 name = "telegram-bot-proxy"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "cryptg" },
     { name = "telethon" },
